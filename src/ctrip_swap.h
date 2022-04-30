@@ -29,7 +29,70 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 #include "server.h"
+#include <rocksdb/c.h>
 
+/* rocks io thread */
+#define ROCKS_GET             	1
+#define ROCKS_PUT            	  2
+#define ROCKS_DEL              	3
+
+#define RIO_CHUNK_SIZE          (16*1024)
+#define RIO_CHUNK_CAPACITY      ((RIO_CHUNK_SIZE - offsetof(RIOChunk,capacity)) / sizeof(RIO))
+
+typedef void (*rocksIOCallback)(int action, sds key, sds val, void *privdata);
+
+typedef struct RIO {
+    unsigned type:4;        /* io type, GET/PUT/DEL */
+    unsigned notify_type:4; /* notify complete type, CQ/PIPE */
+    unsigned reserved:24;   /* reserved */
+    int pipe_fd;            /* PIPE: fd to notify io finished */
+    sds key;                /* rocks key */
+    sds val;                /* rocks val */
+    rocksIOCallback cb;     /* CQ: io finished callback */
+    void *privdata;         /* CQ: io finished privdata */
+} RIO;
+
+typedef struct RIOChunk {
+  struct RIOChunk *next;
+  size_t processed;
+  size_t pending;
+  size_t capacity;
+  RIO rios[];
+} RIOChunk;
+
+typedef struct RIOQueue {
+  RIOChunk *head;
+  RIOChunk *tail;
+  size_t len;
+} RIOQueue;
+
+void RIOQueueInit(RIOQueue *q);
+void RIOQueueDeinit(RIOQueue *q);
+void RIOQueuePush(RIOQueue *q, RIO *rio);
+RIO *RIOQueuePeek(RIOQueue *q);
+void RIOQueuePop(RIOQueue *q);
+#define RIOQueueLength(q) ((q)->len)
+
+void rocksIOSubmitAsync(uint32_t dist, int type, sds key, sds val, rocksIOCallback cb, void *privdata);
+void rocksIOSubmitSync(uint32_t dist, int type, sds key, sds val, int notify_fd, void *se);
+void RIOReap(struct RIO *r, sds *key, sds *val);
+unsigned long rocksPendingIOs();
+int rocksIODrain(struct rocks *rocks, mstime_t time_limit);
+
+struct rocks *rocksCreate(void);
+void rocksDestroy(struct rocks *rocks);
+int rocksEvictionsInprogress(void);
+int rocksDelete(redisDb *db, robj *key);
+int rocksFlushAll();
+rocksdb_t *rocksGetDb(struct rocks *rocks);
+int rocksProcessCompleteQueue(struct rocks *rocks);
+void rocksCron();
+int rocksInitThreads(struct rocks *rocks);
+void rocksCreateSnapshot(struct rocks *rocks);
+void rocksUseSnapshot(struct rocks *rocks);
+void rocksReleaseSnapshot(struct rocks *rocks);
+
+/* rocks iter thread */
 #define DEFAULT_BUFFERED_ITER_CAPACITY 256
 #define CACHED_MAX_KEY_LEN 1000
 #define CACHED_MAX_VAL_LEN 4000
@@ -67,9 +130,7 @@ void rocksIterKeyValue(rocksIter *it, sds *rawkey, sds *rawval);
 void rocksReleaseIter(rocksIter *it);
 void rocksIterGetError(rocksIter *it, char **error);
 
-sds rocksEncodeKey(int type, sds key);
-int rocksDecodeKey(const char *rawkey, size_t rawlen, const char **key, size_t *klen);
-
+/* rdb */
 int rdbSaveRocks(rio *rdb, redisDb *db, int rdbflags);
 
 /* parallel swap */
@@ -79,9 +140,10 @@ typedef struct {
     int inprogress;         /* swap entry in progress? */
     int pipe_read_fd;       /* read end to wait rio swap finish. */
     int pipe_write_fd;      /* write end to notify swap finish by rio. */
-    struct RIO *r;          /* swap attached RIO handle. */
     parallelSwapFinishedCb cb; /* swap finished callback. */
     void *pd;               /* swap finished private data. */
+    sds rawkey;
+    sds rawval;
 } swapEntry;
 
 typedef struct parallelSwap {
@@ -96,5 +158,16 @@ int parallelSwapDrain();
 int parallelSwapGet(sds rawkey, parallelSwapFinishedCb cb, void *pd);
 int parallelSwapPut(sds rawkey, sds rawval, parallelSwapFinishedCb cb, void *pd);
 int parallelSwapDel(sds rawkey, parallelSwapFinishedCb cb, void *pd);
+
+/* encoding */
+sds rocksEncodeKey(int type, sds key);
+int rocksDecodeKey(const char *rawkey, size_t rawlen, const char **key, size_t *klen);
+
+/* Whole key swap (string, hash) */
+int swapAnaWk(struct redisCommand *cmd, redisDb *db, robj *key, int *action, char **rawkey, char **rawval, dataSwapFinishedCallback *cb, void **pd);
+void getDataSwapsWk(robj *key, int mode, getSwapsResult *result);
+void setupSwappingClientsWk(redisDb *db, robj *key, void *scs);
+void *lookupSwappingClientsWk(redisDb *db, robj *key);
+void *getComplementSwapsWk(redisDb *db, robj *key, int mode, int *type, getSwapsResult *result, complementObjectFunc *comp, void **pd);
 
 #endif

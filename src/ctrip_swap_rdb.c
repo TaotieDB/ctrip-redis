@@ -200,7 +200,7 @@ int rdbPipeLenByRef(rio* src, rio* target, int *isencoded, uint64_t *lenptr) {
         *lenptr = ntohl(len);
     } else if (buf[0] == RDB_64BITLEN) {
         /* Read a 64 bit len. */
-        uint64_t len;
+        uint64_t len = 0; //TODO confirm 
         if (rioRead(src,target,8) == 0) return -1;
         *lenptr = ntohu64(len);
     } else {
@@ -211,7 +211,7 @@ int rdbPipeLenByRef(rio* src, rio* target, int *isencoded, uint64_t *lenptr) {
     return 0;
 }
 
-int rdbPipeLen(rio* src, rio* target, int *isencoded) {
+uint64_t rdbPipeLen(rio* src, rio* target, int *isencoded) {
     uint64_t len;
     if (rdbPipeLenByRef(src,target,isencoded, &len) == -1) return RDB_LENERR;
     return len;
@@ -220,6 +220,7 @@ int rdbPipeLen(rio* src, rio* target, int *isencoded) {
 int rdbPipeWriteIntegerObject(rio* src, rio* target, int enctype) {
     unsigned char enc[4];
     long long val;
+    UNUSED(val);
 
     if (enctype == RDB_ENC_INT8) {
         if (rioPipe(src,target,enc, 1) == 0) return 0;
@@ -249,6 +250,7 @@ int rdbPipeWirteLzfStringObject(rio* src, rio* target) {
 int rdbPipeWriteStringObject(rio* src, rio* target, int* error) {
     int isencoded;
     unsigned long long len = rdbLoadLen(src, &isencoded);
+    UNUSED(error);
     if (len == RDB_LENERR) return 0;
     rdbSaveLen(target, len);
     if (isencoded) {
@@ -269,9 +271,6 @@ int rdbPipeWriteStringObject(rio* src, rio* target, int* error) {
 
 int rdbPipeWriteHashObject(rio* src, rio* target, int* error) {
     uint64_t len;
-    int ret;
-    sds field, value;
-    dict *dupSearchDict = NULL;
     len = rdbPipeLen(src, target, NULL);
     if (len == RDB_LENERR) {
         return 0;
@@ -300,6 +299,9 @@ int rdbLoadObjectString(int rdbtype, rio* rdb, sds key, struct ctripRdbLoadResul
     rioInitWithBuffer(&obj_rio, sdsempty());
     int error;
     robj* evict;
+
+    UNUSED(key);
+
     if(rdbtype == RDB_TYPE_STRING) {
         evict = createObject(OBJ_STRING, NULL);
         if(rdbPipeWriteStringObject(rdb, &obj_rio, &error) == 0) {

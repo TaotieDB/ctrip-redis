@@ -2696,10 +2696,10 @@ int rdbLoadRio(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
 
         /* Read value */
         struct ctripRdbLoadResult result = {
-            type: HOT_DATA,
-            val: NULL,
-            cold_data: NULL,
-            error: error
+            .type = HOT_DATA,
+            .val = NULL,
+            .cold_data = NULL,
+            .error = 0,
         };
         ctripRdbLoadObject(type, rdb, key, &result);
         error = result.error;

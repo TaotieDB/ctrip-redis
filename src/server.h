@@ -2918,43 +2918,6 @@ int tlsConfigure(redisTLSContextConfig *ctx_config);
 int iAmMaster(void);
 
 #include "ctrip.h"
-#include <rocksdb/c.h>
-
-/* rocks */
-#define ROCKS_GET             	1
-#define ROCKS_PUT            	2
-#define ROCKS_DEL              	3
-
-typedef void (*rocksIOCallback)(int action, sds key, sds val, void *privdata);
-
-typedef struct RIO {
-    int type;               /* io type, GET/PUT/DEL */
-    sds key;                /* rocks key */
-    sds val;                /* rocks val */
-    int notify_type;        /* notify complete type, CQ/PIPE */
-    rocksIOCallback cb;     /* CQ: io finished callback */
-    void *privdata;         /* CQ: io finished privdata */
-    int pipe_fd;            /* PIPE: fd to notify io finished */
-} RIO;
-
-void rocksIOSubmitAsync(uint32_t dist, int type, sds key, sds val, rocksIOCallback cb, void *privdata);
-struct RIO *rocksIOSubmitSync(uint32_t dist, int type, sds key, sds val, int notify_fd);
-void RIOReap(struct RIO *r, sds *key, sds *val);
-unsigned long rocksPendingIOs();
-int rocksIODrain(struct rocks *rocks, mstime_t time_limit);
-
-struct rocks *rocksCreate(void);
-void rocksDestroy(struct rocks *rocks);
-int rocksEvictionsInprogress(void);
-int rocksDelete(redisDb *db, robj *key);
-int rocksFlushAll();
-rocksdb_t *rocksGetDb(struct rocks *rocks);
-int rocksProcessCompleteQueue(struct rocks *rocks);
-void rocksCron();
-int rocksInitThreads(struct rocks *rocks);
-void rocksCreateSnapshot(struct rocks *rocks);
-void rocksUseSnapshot(struct rocks *rocks);
-void rocksReleaseSnapshot(struct rocks *rocks);
 
 /* swap */
 #define SWAP_NOP    0
@@ -3060,13 +3023,6 @@ int swapAna(client *c, robj *key, robj *subkey, int *action, char **rawkey, char
 void dataSwapFinished(client *c, int action, char *rawkey, char *rawval, int cb_type, dataSwapFinishedCallback cb, void *pd);
 void getSwaps(client *c, getSwapsResult *result);
 void releaseSwaps(getSwapsResult *result);
-
-/* Whole key swap (string, hash) */
-int swapAnaWk(struct redisCommand *cmd, redisDb *db, robj *key, int *action, char **rawkey, char **rawval, dataSwapFinishedCallback *cb, void **pd);
-void getDataSwapsWk(robj *key, int mode, getSwapsResult *result);
-void setupSwappingClientsWk(redisDb *db, robj *key, void *scs);
-void *lookupSwappingClientsWk(redisDb *db, robj *key);
-void *getComplementSwapsWk(redisDb *db, robj *key, int mode, int *type, getSwapsResult *result, complementObjectFunc *comp, void **pd);
 
 #include "ctrip_swap.h"
 

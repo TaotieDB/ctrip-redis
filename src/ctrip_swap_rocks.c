@@ -39,19 +39,26 @@
 #define RIO_NOTIFY_CQ           0
 #define RIO_NOTIFY_PIPE         1
 
+#define DEFAULT_PROCESSING_QUEUE_SIZE 1024
+#define RIO_NOTIFY_READ_MAX  512
+
 typedef struct {
     int id;
     pthread_t thread_id;
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    list *pending_rios;
+    RIOQueue pending_rios[1];
+    RIO *processing_rios;
+    int processing_size;
 } RIOThread;
 
 typedef struct {
     int notify_recv_fd;
     int notify_send_fd;
     pthread_mutex_t lock;
-    list *complete_queue;
+    RIOQueue complete_queue[1];
+    RIO *processing_rios;
+    int processing_size;
 } RIOCompleteQueue;
 
 typedef struct rocks {
@@ -70,35 +77,91 @@ typedef struct rocks {
     RIOCompleteQueue CQ;
 } rocks;
 
+int appendToRIOCompleteQueue(RIOCompleteQueue *cq, RIO *rio);
 
-int appendToRIOComplteQueue(RIOCompleteQueue *cq, RIO *rio);
-
-/* Key/val owned by swapper, rocks only ref key/val. */
-RIO *_RIONew(int type, sds key, sds val, int notify_type,
-        rocksIOCallback cb, void *privdata, int pipe_fd) {
-    RIO *rio = zmalloc(sizeof(RIO));
+/* --- RIO: rocks io request context  --- */
+/* Note that key/val owned by caller(val moved to caller for GET), rocks
+ * io thread only ref key/val. */
+void _RIOInit(RIO* rio, int type, int notify_type, sds key, sds val,
+        rocksIOCallback cb, void *pd, int pipe_fd) {
     rio->type = type;
+    rio->notify_type = notify_type;
     rio->key = key;
     rio->val = val;
-    rio->notify_type = notify_type;
     rio->cb = cb;
-    rio->privdata = privdata;
+    rio->privdata = pd;
     rio->pipe_fd = pipe_fd;
-    return rio;
 }
 
-RIO *RIONewAsync(int type, sds key, sds val, rocksIOCallback cb, void *privdata) {
-    return _RIONew(type, key, val, RIO_NOTIFY_CQ, cb, privdata, -1);
+void RIOInitAsync(RIO* rio, int type, sds key, sds val, rocksIOCallback cb, void *pd) {
+    _RIOInit(rio, type, RIO_NOTIFY_CQ, key, val, cb, pd, -1);
 }
 
-RIO *RIONewSync(int type, sds key, sds val, int pipe_fd) {
-    return _RIONew(type, key, val, RIO_NOTIFY_PIPE, NULL, NULL, pipe_fd);
+void RIOInitSync(RIO* rio, int type, sds key, sds val, int pipe_fd, void *se) {
+    _RIOInit(rio, type, RIO_NOTIFY_PIPE, key, val, NULL, se, pipe_fd);
 }
 
-void RIOFree(RIO *req) {
-    zfree(req);
+/* --- RIOQueue: singly linked list of RIO chunks  --- */
+void RIOQueueInit(RIOQueue *q) {
+    q->head = q->tail = NULL;
+    q->len = 0;
 }
 
+void RIOQueueDeinit(RIOQueue *q) {
+    if (q == NULL) return;
+    RIOChunk *chunk = q->head, *next;
+    while (chunk) {
+        next = chunk->next;
+        zfree(chunk);
+        chunk = next;
+    }
+    q->head = q->tail = NULL;
+    q->len = 0;
+}
+
+void RIOQueuePush(RIOQueue *q, RIO *rio) {
+    RIO *pushed;
+    if (q->tail == NULL || q->tail->pending == q->tail->capacity) {
+        RIOChunk *chunk = zmalloc(RIO_CHUNK_SIZE);
+        chunk->next = NULL;
+        chunk->capacity = RIO_CHUNK_CAPACITY;
+        chunk->pending = chunk->processed = 0;
+
+        if (q->tail) q->tail->next = chunk;
+        q->tail = chunk;
+        if (q->head == NULL) q->head = chunk;
+    }
+    pushed = q->tail->rios + q->tail->pending++;
+    memcpy(pushed,rio,sizeof(RIO));
+    q->len++;
+    serverLog(LL_WARNING, "[xxx] push : %ld", q->len);
+}
+
+RIO* RIOQueuePeek(RIOQueue *q) {
+    RIOChunk *chunk = q->head;
+    if (q == NULL || chunk == NULL || chunk->processed == chunk->pending)
+        return NULL;
+    serverAssert(chunk->processed < chunk->pending); //TODO remove assert
+    serverAssert(chunk->pending <= chunk->capacity);
+    return chunk->rios + chunk->processed;
+}
+
+void RIOQueuePop(RIOQueue *q) {
+    RIOChunk *chunk = q->head;
+    serverAssert(chunk); // TODO remove assert
+    serverAssert(chunk->processed < chunk->pending);
+    serverAssert(chunk->pending <= chunk->capacity);
+    chunk->processed++;
+    if (chunk->processed == chunk->capacity) {
+        q->head = chunk->next;
+        if (q->tail == chunk) q->tail = NULL;
+        zfree(chunk);
+    }
+    q->len--;
+    serverLog(LL_WARNING, "[xxx] pop : %ld", q->len);
+}
+
+/* --- rio rocksdb operations --- */
 int doRIORead(RIO *rio) {
     size_t vallen;
     char *err = NULL, *val;
@@ -167,35 +230,34 @@ void *RIOThreadMain (void *arg) {
     redis_set_thread_title(thdname);
 
     while (1) {
-        listIter li;
-        listNode *ln;
-        list *processing_rios = listCreate();
+        int processing_count = 0, i;
+        RIO *rio;
 
         pthread_mutex_lock(&thread->lock);
-        while (listLength(thread->pending_rios) == 0)
+        while (RIOQueueLength(thread->pending_rios) == 0)
             pthread_cond_wait(&thread->cond, &thread->lock);
 
-        listRewind(thread->pending_rios, &li);
-        while ((ln = listNext(&li))) {
-            RIO *rio = listNodeValue(ln);
-            listAddNodeHead(processing_rios, rio);
-            listDelNode(thread->pending_rios, ln);
+        while ((rio = RIOQueuePeek(thread->pending_rios)) &&
+                processing_count < thread->processing_size) {
+            thread->processing_rios[processing_count++] = *rio;
+            RIOQueuePop(thread->pending_rios);
         }
         pthread_mutex_unlock(&thread->lock);
 
-        listRewind(processing_rios, &li);
-        while ((ln = listNext(&li))) {
-            RIO *rio = listNodeValue(ln);
+        for (i = 0; i < processing_count; i++) {
+            RIO *rio = thread->processing_rios+i;
 
             doRIO(rio); 
 
             if (rio->notify_type == RIO_NOTIFY_CQ) {
                 if (rio->cb != NULL) {
-                    appendToRIOComplteQueue(&server.rocks->CQ, rio);
-                } else {
-                    RIOFree(rio);
+                    appendToRIOCompleteQueue(&server.rocks->CQ, rio); //TODO reduce lock
                 }
             } else { /* RIO_NOTIFY_PIPE */
+                /* TODO dirty hack, use NOTIFY_CQ to replace NOTIF_PIPE  */
+                swapEntry *se = rio->privdata;
+                se->rawkey = rio->key;
+                se->rawval = rio->val;
                 if (write(rio->pipe_fd, "x", 1) < 1 && errno != EAGAIN) {
                     static mstime_t prev_log;
                     if (server.mstime - prev_log >= 1000) {
@@ -207,38 +269,32 @@ void *RIOThreadMain (void *arg) {
                 }
             }
         }
-
-        listRelease(processing_rios);
     }
 
     return NULL;
 }
 
 int processFinishedRIOInCompleteQueue(RIOCompleteQueue *cq) {
-    int processed;
-    listIter li;
-    listNode *ln;
-    list *processing_rios = listCreate();
+    RIO *rio;
+    int processing_count = 0, i;
 
     pthread_mutex_lock(&cq->lock);
-    listRewind(cq->complete_queue, &li);
-    while ((ln = listNext(&li))) {
-        listAddNodeTail(processing_rios, listNodeValue(ln));
-        listDelNode(cq->complete_queue, ln);
+    while (RIOQueueLength(cq->complete_queue) && 
+            processing_count < cq->processing_size) {
+        rio = cq->processing_rios + processing_count;
+        memcpy(rio, RIOQueuePeek(cq->complete_queue),sizeof(RIO));
+        RIOQueuePop(cq->complete_queue);
+        processing_count++;
     }
     pthread_mutex_unlock(&cq->lock);
 
-    listRewind(processing_rios, &li);
-    while ((ln = listNext(&li))) {
-        RIO *rio = listNodeValue(ln);
+    for (i = 0; i < processing_count; i++) {
+        rio = cq->processing_rios + i;
         serverAssert(rio->cb);
         rio->cb(rio->type, rio->key, rio->val, rio->privdata);
-        RIOFree(rio);
     }
 
-    processed = listLength(processing_rios);
-    listRelease(processing_rios);
-    return processed;
+    return processing_count;
 }
 
 /* read before unlink clients so that main thread won't miss notify event:
@@ -247,7 +303,6 @@ int processFinishedRIOInCompleteQueue(RIOCompleteQueue *cq) {
  * if main thread read less notify bytes than unlink clients num (e.g. rockdb thread
  * link more clients when , main thread would still be triggered because epoll
  * LT-triggering mode. */
-#define RIO_NOTIFY_READ_MAX  512
 void RIOFinished(aeEventLoop *el, int fd, void *privdata, int mask) {
     char notify_recv_buf[RIO_NOTIFY_READ_MAX];
 
@@ -265,25 +320,26 @@ void RIOFinished(aeEventLoop *el, int fd, void *privdata, int mask) {
     processFinishedRIOInCompleteQueue(privdata); /* privdata is cq */
 }
 
-void rocksIOSubmitAsync(uint32_t dist, int type, sds key, sds val, rocksIOCallback cb, void *privdata) {
+void rocksIOSubmitAsync(uint32_t dist, int type, sds key, sds val, rocksIOCallback cb, void *pd) {
+    struct RIO rio;
     serverAssert(server.rocks->threads_num >= 0);
     RIOThread *rt = &server.rocks->threads[dist % server.rocks->threads_num];
-    RIO *rio = RIONewAsync(type, key, val, cb, privdata);
     pthread_mutex_lock(&rt->lock);
-    listAddNodeTail(rt->pending_rios, rio);
+    RIOInitAsync(&rio, type, key, val, cb, pd);
+    RIOQueuePush(rt->pending_rios, &rio);
     pthread_cond_signal(&rt->cond);
     pthread_mutex_unlock(&rt->lock);
 }
 
-RIO *rocksIOSubmitSync(uint32_t dist, int type, sds key, sds val, int notify_fd) {
+void rocksIOSubmitSync(uint32_t dist, int type, sds key, sds val, int notify_fd, void *se) {
+    struct RIO rio;
     serverAssert(server.rocks->threads_num >= 0);
     RIOThread *rt = &server.rocks->threads[dist % server.rocks->threads_num];
-    struct RIO *rio = RIONewSync(type, key, val, notify_fd);
+    RIOInitSync(&rio, type, key, val, notify_fd, se);
     pthread_mutex_lock(&rt->lock);
-    listAddNodeTail(rt->pending_rios, rio);
+    RIOQueuePush(rt->pending_rios, &rio);
     pthread_cond_signal(&rt->cond);
     pthread_mutex_unlock(&rt->lock);
-    return rio;
 }
 
 static int rocksRIODrained(rocks *rocks) {
@@ -294,12 +350,12 @@ static int rocksRIODrained(rocks *rocks) {
         rt = &server.rocks->threads[i];
 
         pthread_mutex_lock(&rt->lock);
-        if (listLength(rt->pending_rios)) drained = 0;
+        if (RIOQueueLength(rt->pending_rios)) drained = 0;
         pthread_mutex_unlock(&rt->lock);
     }
 
     pthread_mutex_lock(&rocks->CQ.lock);
-    if (listLength(rocks->CQ.complete_queue)) drained = 0;
+    if (RIOQueueLength(rocks->CQ.complete_queue)) drained = 0;
     pthread_mutex_unlock(&rocks->CQ.lock);
 
     return drained;
@@ -325,15 +381,9 @@ int rocksIODrain(rocks *rocks, mstime_t time_limit) {
     return result;
 }
 
-void RIOReap(RIO *r, sds *key, sds *val) {
-    if (key) *key = r->key;
-    if (val) *val = r->val;
-    RIOFree(r);
-}
-
-int appendToRIOComplteQueue(RIOCompleteQueue *cq, RIO *rio) {
+int appendToRIOCompleteQueue(RIOCompleteQueue *cq, RIO *rio) {
     pthread_mutex_lock(&cq->lock);
-    listAddNodeTail(cq->complete_queue, rio);
+    RIOQueuePush(cq->complete_queue, rio);
     pthread_mutex_unlock(&cq->lock);
     if (write(cq->notify_send_fd, "x", 1) < 1 && errno != EAGAIN) {
         static mstime_t prev_log;
@@ -353,7 +403,7 @@ unsigned long rocksPendingIOs() {
     for (i = 0; i < server.rocks->threads_num; i++) {
         RIOThread *rt = &server.rocks->threads[i];
         pthread_mutex_lock(&rt->lock);
-        pending += listLength(rt->pending_rios);
+        pending += RIOQueueLength(rt->pending_rios);
         pthread_mutex_unlock(&rt->lock);
     }
     return pending;
@@ -374,7 +424,9 @@ static int rocksInitCompleteQueue(rocks *rocks) {
 
     pthread_mutex_init(&cq->lock, NULL);
 
-    cq->complete_queue = listCreate();
+    RIOQueueInit(cq->complete_queue);
+    cq->processing_size = DEFAULT_PROCESSING_QUEUE_SIZE;
+    cq->processing_rios = zmalloc(sizeof(RIO*)*cq->processing_size);
 
     if (anetNonBlock(anetErr, cq->notify_recv_fd) != ANET_OK) {
         serverLog(LL_WARNING,
@@ -405,7 +457,8 @@ static void rocksDeinitCompleteQueue(rocks *rocks) {
     close(cq->notify_recv_fd);
     close(cq->notify_send_fd);
     pthread_mutex_destroy(&cq->lock);
-    listRelease(cq->complete_queue);
+    RIOQueueDeinit(cq->complete_queue);
+    zfree(cq->processing_rios);
 }
 
 int rocksProcessCompleteQueue(rocks *rocks) {
@@ -488,7 +541,9 @@ int rocksInitThreads(rocks *rocks) {
         RIOThread *thread = &rocks->threads[i];
 
         thread->id = i;
-        thread->pending_rios = listCreate();
+        RIOQueueInit(thread->pending_rios);
+        thread->processing_size = DEFAULT_PROCESSING_QUEUE_SIZE;
+        thread->processing_rios = zmalloc(sizeof(RIO*)*thread->processing_size);
         pthread_mutex_init(&thread->lock, NULL);
         pthread_cond_init(&thread->cond, NULL);
         if (pthread_create(&thread->thread_id, NULL, RIOThreadMain, thread)) {
@@ -505,7 +560,8 @@ static void rocksDeinitThreads(rocks *rocks) {
 
     for (i = 0; i < rocks->threads_num; i++) {
         RIOThread *thread = &rocks->threads[i];
-        listRelease(thread->pending_rios);
+        RIOQueueDeinit(thread->pending_rios);
+        zfree(thread->processing_rios);
         if (thread->thread_id == pthread_self()) continue;
         if (thread->thread_id && pthread_cancel(thread->thread_id) == 0) {
             if ((err = pthread_join(thread->thread_id, NULL)) != 0) {
@@ -556,7 +612,7 @@ void rocksReleaseSnapshot(rocks *rocks) {
     }
 }
 
-/* -------------- rocks iter ----------------- */
+/* --- rocks iter ---- */
 static int rocksIterWaitReady(rocksIter* it) {
     bufferedIterCompleteQueue *cq = it->buffered_cq;
     pthread_mutex_lock(&cq->buffer_lock);

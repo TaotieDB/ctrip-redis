@@ -1357,19 +1357,17 @@ void parallelSwapFree(parallelSwap *ps) {
 static int parallelSwapProcess(swapEntry *e) {
     if (e->inprogress) {
         char c;
-        sds rawkey, rawval;
         if (read(e->pipe_read_fd, &c, 1) != 1) {
             serverLog(LL_WARNING, "wait swap entry failed: %s",
                     strerror(errno));
             return C_ERR;
         }
         e->inprogress = 0;
-        RIOReap(e->r, &rawkey, &rawval);
         if (e->cb) {
-            return e->cb(rawkey, rawval, e->pd);
+            return e->cb(e->rawkey, e->rawval, e->pd);
         } else {
-            sdsfree(rawkey);
-            sdsfree(rawval);
+            sdsfree(e->rawkey);
+            sdsfree(e->rawval);
         }
     }
     return C_OK;
@@ -1389,8 +1387,8 @@ int parallelSwapSubmit(parallelSwap *ps, int action, sds rawkey, sds rawval, par
     e->cb = cb;
     e->pd = pd;
     e->inprogress = 1;
-    e->r = rocksIOSubmitSync(rocksdist++, action, rawkey, rawval,
-            e->pipe_write_fd);
+    rocksIOSubmitSync(rocksdist++, action, rawkey, rawval,
+            e->pipe_write_fd, e);
     return C_OK;
 }
 
